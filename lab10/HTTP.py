@@ -1,6 +1,5 @@
 import asyncore
 import asynchat
-import socket
 import multiprocessing
 import logging
 import mimetypes
@@ -89,15 +88,16 @@ class AsyncHTTPRequestHandler(asynchat.async_chat):
                 self.respond(400)
                 return
             if self.method == "POST":
-                content_length = self.request_headers['content-length']
-                if content_length>0:
+                content_length = self.request_headers['Content-Length']
+                self.log(f">>>>>PARSING, METHOD IS POST, length is {content_length}")
+                if content_length != "0":
                     self.set_terminator(content_length)
                 else:
                     self.handle_request()
             else:
                 self.handle_request()
         else:
-            self.parse_body()
+            self.body = self._get_data()
             self.handle_request()
 
     def parse_headers(self):
@@ -105,17 +105,22 @@ class AsyncHTTPRequestHandler(asynchat.async_chat):
         self.log(">>>Parsing headers")
         raw = str(self.incoming[0])
 
-        for string in raw.split("\\r\\n"):
-            if string.find("b'") != -1:
-                self.method = string.split(" ")[0].replace("b'", "")
-                self.request_headers['method'] = self.method
-                self.uri = string.split(" ")[1]
-                self.request_headers["uri"] = self.uri
-                self.protocol = string.split(" ")[2]
-                self.request_headers['protocol'] = self.protocol
-            else:
-                h = string.split(": ")
-                self.request_headers[h[0]] = h[1]
+        raw = raw[2:-1]
+        state, headers = raw.split("\\r\\n", 1)
+        self.log(f"STATE IS {state}, HEADERS IS {headers}")
+
+        self.method = state.split(" ")[0].replace("b'", "")
+        self.request_headers['method'] = self.method
+        self.uri = state.split(" ")[1]
+        if "?" in self.uri:
+            self.uri, self.query_string = self.uri.split("?")
+        self.request_headers["uri"] = self.uri
+        self.protocol = state.split(" ")[2]
+        self.request_headers['protocol'] = self.protocol
+
+        for string in headers.split("\\r\\n"):
+            h = string.split(": ")
+            self.request_headers[h[0]] = h[1]
 
         self.isParsed = True
         self.log(self.request_headers)
@@ -126,72 +131,119 @@ class AsyncHTTPRequestHandler(asynchat.async_chat):
         method_name = 'do_' + self.method
         if not hasattr(self, method_name):
             self.respond(405)
-            self.handle_close()
         else:
             handler = getattr(self, method_name)
             handler()
 
-    def send_header(self, keyword, value):
-        # TODO добавляет новый заголовок (в словарь) для отправки клиенту - формирование заголовков для ответа клиенту
-        if keyword.lower() == 'connection':
-            if value.lower() == 'close':
-                self.close_connection = 1
-            elif value.lower() == 'keep-alive':
-                self.close_connection = 0
-        self.response_headers[keyword] = value
-
-
-
-
-    def send_response(self, data):
-        if self.method == 'POST':
-            pass
-        else:
-            if len(data) > 0:
-                self.push(data)
-
-    def date_time_string(self):
-        weekdayname = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
-        monthname = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
-        year, month, day, hh, mm, ss, wd, y, z = time.gmtime(time.time())
-        return f"{weekdayname[wd]}, {day} {monthname[month]} {year} {hh}:{mm}:{ss} GMT"
-
-    def send_head(self):
-        # TODO
-        pass
-
-    def do_GET(self):
-        # TODO
-        self.log(">>Do_get")
-        pass
-
-    def do_HEAD(self):
-        # TODO
-        self.log(">>Do_head")
-        pass
-
-    def do_POST(self):
-        # TODO
-        self.log(">>Do_post")
-        self.request_headers['content-length']
-        pass
-
-    def translate_path(self, path):
-        # TODO
-        path = url_normalize(path)
-        return path
-
-    def add_terminator(self):
-        self.push()
-
     def respond(self, code, data=''):
-        self.log(f"Responding withe code ${code}")
+        self.log(f"Responding with code {code}")
         try:
             message, _ = self.responses[code]
         except KeyError:
             message = '???'
-            # TODO
 
+        if len(data) > 0:
+            self.response_headers["Content-Length"] = len(data)
+
+        self.begin_response(code, message)
+        self.send_response(data)
+        self.add_terminator(2)
+        self.close_when_done()
+
+    def begin_response(self, code, message):
+        self.log(f">>Begin response")
+        self.log(f"{self.protocol} {code} {message}")
+        self.push(to_byte(f"{self.protocol} {code} {message}\r\n"))
+        self.log(f"Response headers: {self.response_headers}")
+        for key, value in self.response_headers.items():
+            self.send_header(key, value)
+        self.add_terminator()
+
+    def send_header(self, keyword, value):
+        self.log(f">>PUSHING HEADER {keyword} {value}")
+        self.push(to_byte("{}: {}\r\n".format(keyword, value)))
+
+    def send_response(self, data):
+        self.log(f">>Sending response")
+        if self.method == 'POST':
+            pass
+        else:
+            if len(data) > 0 and self.method != "HEAD":
+                if self.isText:
+                    self.push(to_byte(data))
+                else:
+                    self.push(data)
+
+    def do_GET(self):
+        self.log(">>Do_get")
+        self.send_head()
+
+    def do_HEAD(self):
+        self.log(">>Do_head")
+        self.send_head()
+
+    def do_POST(self):
+        self.log(">>Do_post")
+        if self.uri.endswith('.html'):
+            self.respond(400)
+        else:
+            self.response_headers['Content-Length'] = len(self.body)
+            self.respond(200)
+
+    def send_head(self):
+        self.log(f">>Sending head")
+        path = self.translate_path(self.uri)
+
+        self.log(f"Current directory is {os.getcwd()}, path is {path}")
+
+        if os.path.isdir(path) or path == "":
+            path = os.path.join(path, "index.html")
+            if not os.path.exists(path):
+                self.respond(403)
+
+        data = ""
+
+        _, ext = os.path.splitext(path)
+
+        try:
+            ctype = mimetypes.types_map[ext.lower()]
+            self.log(f">>>>> File type is {ctype}")
+            self.isText = ctype in self.text_types
+        except KeyError:
+            self.respond(403)
+
+        try:
+            if self.isText:
+                self.log(">>This is a text type")
+                read_mode = "r"
+            else:
+                self.log(">>This is NOT a text type")
+                read_mode = "rb"
+            f = open(path, read_mode)
+            data = f.read()
+            self.log(f"Read {len(data)} bytes")
+            f.close()
+            # При тесте картинок добавить бинарное чтение
+        except IOError:
+            self.respond(404)
+            return None
+
+        self.response_headers["Content-Type"] = ctype
+        self.respond(200, data)
+
+    def translate_path(self, path):
+        self.log("************Translating path")
+        path = url_normalize(urllib.parse.unquote(path))
+        self.log(f"Path after unquoting {path}")
+        if path.startswith("/"):
+            path = path[1:]
+        return path
+
+    def add_terminator(self, count=1):
+        self.push(to_byte(count * "\r\n"))
+
+    def date_time_string(self):
+        return time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
 
     responses = {
         200: ('OK', 'Request fulfilled, document follows'),
@@ -203,6 +255,8 @@ class AsyncHTTPRequestHandler(asynchat.async_chat):
         405: ('Method Not Allowed',
               'Specified method is invalid for this resource.'),
     }
+
+    text_types = ["text/html"]
 
 
 def parse_args():
